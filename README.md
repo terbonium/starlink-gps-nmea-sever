@@ -5,6 +5,8 @@ Connects to your Starlink dish via gRPC and serves real-time GPS data as NMEA 01
 ## Features
 
 - **Real-time GPS data** from Starlink dish via gRPC reflection API
+- **Compass heading** from Starlink dish alignment stats (with configurable offset for dish-to-vessel alignment)
+- **Tilt sensor data** derived from dish boresight elevation
 - **Standard NMEA 0183 output** compatible with chart plotters, autopilots, and navigation software
 - **Automatic velocity calculation** (speed and heading derived from position changes)
 - **Configurable update rates** for both GPS polling and NMEA output
@@ -52,6 +54,7 @@ nc localhost 10110
 | `--rate` | 1.0 | NMEA output rate (seconds) |
 | `--poll-interval` | 0.5 | GPS polling interval (seconds) |
 | `--smoothing` | 6 | Number of samples to average for speed/heading |
+| `--heading-offset` | 0.0 | Static compass heading offset in degrees (see below) |
 | `--debug` | false | Enable debug logging |
 
 ### Docker Compose Configuration
@@ -71,6 +74,7 @@ services:
       --rate 1.0
       --poll-interval 0.5
       --smoothing 6
+      --heading-offset 321.7
     restart: unless-stopped
 ```
 
@@ -98,7 +102,33 @@ The `--smoothing` parameter controls how many GPS samples are averaged to calcul
 
 The heading uses circular averaging to properly handle the 0°/360° boundary.
 
+### Compass Heading Offset
+
+The Starlink dish reports its boresight azimuth (the direction the dish is pointing). Since the dish may not be installed aligned with your vessel's centerline, you can configure a static offset to convert the dish azimuth to vessel heading:
+
+```
+vessel_heading = dish_boresight_azimuth + heading_offset
+```
+
+**To calculate your offset:**
+
+1. Point your vessel at a known heading (e.g., using a handheld compass or landmark)
+2. Note the `boresightAzimuthDeg` value from the Starlink diagnostics
+3. Calculate: `offset = known_heading - boresight_azimuth`
+
+**Example:**
+- Vessel heading: 281°
+- Dish boresight azimuth: -40.73°
+- Offset: 281 - (-40.73) = **321.73°**
+
+```yaml
+command: >
+  --heading-offset 321.73
+```
+
 ## Generated NMEA Sentences
+
+### GPS Sentences
 
 | Sentence | Description |
 |----------|-------------|
@@ -108,6 +138,20 @@ The heading uses circular averaging to properly handle the 0°/360° boundary.
 | GPVTG | Track Made Good and Ground Speed |
 | GPRMC | Recommended Minimum Navigation Information |
 | GPGSA | GPS DOP and Active Satellites |
+
+### Compass/Heading Sentences (from Starlink alignment stats)
+
+| Sentence | Description |
+|----------|-------------|
+| HCHDM | Heading, Magnetic (with offset applied) |
+| HCHDT | Heading, True (magnetic heading adjusted for variation) |
+| HCHDG | Heading with Deviation & Variation |
+
+### Sensor Sentences
+
+| Sentence | Description |
+|----------|-------------|
+| HCXDR | Transducer Measurement - Tilt/Pitch (degrees off vertical) |
 
 ## Sample Output
 
@@ -121,6 +165,10 @@ $GPGLL,2654.373395,N,08234.690521,W,120000.00,A,A*7E
 $GPVTG,139.3,T,142.3,M,10.0,N,18.5,K,A*22
 $GPRMC,120000.00,A,2654.373395,N,08234.690521,W,10.0,139.3,111225,3.0,W,A,V*44
 $GPGSA,A,3,05,06,11,12,13,15,18,20,21,23,25,,1.8,0.9,1.6,1*28
+$HCHDM,281.0,M*1A
+$HCHDT,278.0,T*1B
+$HCHDG,281.0,,,3.0,W*0C
+$HCXDR,A,2.3,D,PTCH*5E
 ```
 
 ## Integration Examples

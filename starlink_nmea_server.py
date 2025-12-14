@@ -48,13 +48,19 @@ class GPSData:
     speed_mps: float = 0.0
     heading: float = 0.0
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    
+
+    # Compass data from Starlink alignment stats
+    compass_heading: Optional[float] = None  # Magnetic heading (with offset applied)
+    boresight_azimuth: Optional[float] = None  # Raw dish azimuth
+    boresight_elevation: Optional[float] = None  # Dish elevation (for tilt calc)
+    tilt: Optional[float] = None  # Degrees off vertical (90 - elevation)
+
     hdop: float = 0.9
     vdop: float = 1.6
     pdop: float = 1.8
     satellites_used: int = 11
     fix_quality: int = 1
-    
+
     _prev_lat: float = field(default=0.0, repr=False)
     _prev_lon: float = field(default=0.0, repr=False)
     _prev_time: Optional[datetime] = field(default=None, repr=False)
@@ -122,15 +128,17 @@ class GPSData:
 
 class StarlinkGRPCClient:
     """gRPC client using reflection to communicate with Starlink"""
-    
-    def __init__(self, dish_address: str = "192.168.100.1:9200", smoothing_window: int = 6):
+
+    def __init__(self, dish_address: str = "192.168.100.1:9200", smoothing_window: int = 6,
+                 heading_offset: float = 0.0):
         self.dish_address = dish_address
         self.channel = None
         self.gps_data = GPSData()
         self.gps_data._smoothing_window = smoothing_window
+        self.heading_offset = heading_offset  # Static offset: vessel_heading = boresight_azimuth + offset
         self.connected = False
         self.lock = threading.Lock()
-        
+
         # Protobuf reflection components
         self.reflection_db = None
         self.desc_pool = None
@@ -233,44 +241,110 @@ class StarlinkGRPCClient:
                     return result
             
             return {'lat': 0.0, 'lon': 0.0, 'alt': 0.0, 'speed_mps': 0.0}
-            
+
         except Exception as e:
             logger.warning(f"Location request error: {e}")
             return {'lat': 0.0, 'lon': 0.0, 'alt': 0.0, 'speed_mps': 0.0}
-    
+
+    def _create_status_request(self):
+        """Create a GetStatus request using reflection"""
+        request = self.request_type()
+        request.get_status.SetInParent()
+        return request
+
+    def get_status(self) -> dict:
+        """Get dish status including alignment stats from Starlink dish"""
+        try:
+            request = self._create_status_request()
+
+            handle_method = self.channel.unary_unary(
+                '/SpaceX.API.Device.Device/Handle',
+                request_serializer=lambda x: x.SerializeToString(),
+                response_deserializer=self.response_type.FromString,
+            )
+
+            response = handle_method(request, timeout=5)
+            which_response = response.WhichOneof('response')
+
+            if which_response == 'dish_get_status':
+                status = response.dish_get_status
+
+                # Extract alignment stats
+                result = {
+                    'boresight_azimuth': None,
+                    'boresight_elevation': None,
+                }
+
+                if hasattr(status, 'alignment_stats'):
+                    alignment = status.alignment_stats
+                    # These may be strings in some firmware versions
+                    if hasattr(alignment, 'boresight_azimuth_deg'):
+                        az = alignment.boresight_azimuth_deg
+                        result['boresight_azimuth'] = float(az) if az else None
+                    if hasattr(alignment, 'boresight_elevation_deg'):
+                        el = alignment.boresight_elevation_deg
+                        result['boresight_elevation'] = float(el) if el else None
+
+                return result
+
+            return {'boresight_azimuth': None, 'boresight_elevation': None}
+
+        except Exception as e:
+            logger.warning(f"Status request error: {e}")
+            return {'boresight_azimuth': None, 'boresight_elevation': None}
+
     def start_polling(self, interval: float = 0.5):
-        """Poll location data continuously"""
+        """Poll location and status data continuously"""
         logger.info(f"Starting GPS polling (interval: {interval}s)")
-        
+        if self.heading_offset != 0:
+            logger.info(f"Compass heading offset: {self.heading_offset:.1f}°")
+
         poll_count = 0
         while self.connected:
             try:
                 poll_count += 1
                 location = self.get_location()
-                
+                status = self.get_status()
+
                 if location['lat'] != 0 or location['lon'] != 0:
                     with self.lock:
                         self.gps_data.latitude = location['lat']
                         self.gps_data.longitude = location['lon']
                         self.gps_data.altitude = location['alt']
                         self.gps_data.timestamp = datetime.now(timezone.utc)
-                        
+
                         # Use speed from Starlink if available
                         if location.get('speed_mps', 0) > 0:
                             self.gps_data.speed_mps = location['speed_mps']
-                        
+
                         # Still update heading from position changes
                         self.gps_data.update_velocity()
-                    
+
+                        # Update compass data from alignment stats
+                        self.gps_data.boresight_azimuth = status.get('boresight_azimuth')
+                        self.gps_data.boresight_elevation = status.get('boresight_elevation')
+
+                        # Calculate compass heading with offset
+                        if self.gps_data.boresight_azimuth is not None:
+                            raw_heading = self.gps_data.boresight_azimuth + self.heading_offset
+                            self.gps_data.compass_heading = raw_heading % 360
+
+                        # Calculate tilt (degrees off vertical)
+                        if self.gps_data.boresight_elevation is not None:
+                            self.gps_data.tilt = 90.0 - self.gps_data.boresight_elevation
+
                     if poll_count <= 3 or poll_count % 20 == 0:
+                        compass_str = f", compass={self.gps_data.compass_heading:.1f}°" if self.gps_data.compass_heading is not None else ""
+                        tilt_str = f", tilt={self.gps_data.tilt:.1f}°" if self.gps_data.tilt is not None else ""
                         logger.info(
                             f"GPS: {location['lat']:.6f}, {location['lon']:.6f}, "
                             f"alt={location['alt']:.1f}m, speed={self.gps_data.speed_knots:.1f}kts"
+                            f"{compass_str}{tilt_str}"
                         )
-                    
+
             except Exception as e:
                 logger.warning(f"Polling error: {e}")
-            
+
             time.sleep(interval)
     
     def get_gps_data(self) -> GPSData:
@@ -283,6 +357,10 @@ class StarlinkGRPCClient:
                 speed_mps=self.gps_data.speed_mps,
                 heading=self.gps_data.heading,
                 timestamp=self.gps_data.timestamp,
+                compass_heading=self.gps_data.compass_heading,
+                boresight_azimuth=self.gps_data.boresight_azimuth,
+                boresight_elevation=self.gps_data.boresight_elevation,
+                tilt=self.gps_data.tilt,
                 hdop=self.gps_data.hdop,
                 vdop=self.gps_data.vdop,
                 pdop=self.gps_data.pdop,
@@ -405,15 +483,65 @@ class NMEAGenerator:
     
     def generate_gpgsa(self) -> str:
         active_prns = [s['prn'] for s in self.satellites if s['in_use']]
-        prn_fields = [f"{prn:02d}" if i < len(active_prns) else "" 
+        prn_fields = [f"{prn:02d}" if i < len(active_prns) else ""
                       for i, prn in enumerate(active_prns[:12] + [0] * 12)][:12]
-        
+
         sentence = (
             f"GPGSA,A,3,{','.join(prn_fields)},"
             f"{self.gps.pdop:.1f},{self.gps.hdop:.1f},{self.gps.vdop:.1f},1"
         )
         return format_nmea_sentence(sentence)
-    
+
+    def generate_hchdm(self) -> Optional[str]:
+        """Generate HDM - Heading Magnetic sentence
+        Format: $HCHDM,x.x,M*cs
+        """
+        if self.gps.compass_heading is None:
+            return None
+
+        sentence = f"HCHDM,{self.gps.compass_heading:.1f},M"
+        return format_nmea_sentence(sentence)
+
+    def generate_hchdt(self) -> Optional[str]:
+        """Generate HDT - Heading True sentence
+        Format: $HCHDT,x.x,T*cs
+        Note: We calculate true heading by applying magnetic variation to compass heading
+        """
+        if self.gps.compass_heading is None:
+            return None
+
+        # True heading = Magnetic heading - magnetic variation (west positive)
+        true_heading = (self.gps.compass_heading - self.magnetic_variation) % 360
+        sentence = f"HCHDT,{true_heading:.1f},T"
+        return format_nmea_sentence(sentence)
+
+    def generate_hchdg(self) -> Optional[str]:
+        """Generate HDG - Heading, Deviation & Variation sentence
+        Format: $HCHDG,x.x,x.x,a,x.x,a*cs
+        Fields: heading, deviation, dev_dir, variation, var_dir
+        """
+        if self.gps.compass_heading is None:
+            return None
+
+        # We don't have deviation data, so leave it empty
+        # Variation: positive = West, negative = East
+        var_dir = 'W' if self.magnetic_variation >= 0 else 'E'
+        sentence = f"HCHDG,{self.gps.compass_heading:.1f},,,{abs(self.magnetic_variation):.1f},{var_dir}"
+        return format_nmea_sentence(sentence)
+
+    def generate_hcxdr_tilt(self) -> Optional[str]:
+        """Generate XDR - Transducer Measurement for tilt/pitch
+        Format: $HCXDR,A,x.x,D,PTCH*cs
+        A = Angular displacement, D = Degrees
+        PTCH = Pitch transducer ID
+        """
+        if self.gps.tilt is None:
+            return None
+
+        # Tilt is reported as degrees off vertical (positive = tilted)
+        sentence = f"HCXDR,A,{self.gps.tilt:.1f},D,PTCH"
+        return format_nmea_sentence(sentence)
+
     def generate_all(self) -> List[str]:
         sentences = []
         sentences.extend(self.generate_gpgsv())
@@ -422,6 +550,23 @@ class NMEAGenerator:
         sentences.append(self.generate_gpvtg())
         sentences.append(self.generate_gprmc())
         sentences.append(self.generate_gpgsa())
+
+        # Compass heading sentences (if available)
+        hdm = self.generate_hchdm()
+        if hdm:
+            sentences.append(hdm)
+        hdt = self.generate_hchdt()
+        if hdt:
+            sentences.append(hdt)
+        hdg = self.generate_hchdg()
+        if hdg:
+            sentences.append(hdg)
+
+        # Tilt sensor data (if available)
+        xdr = self.generate_hcxdr_tilt()
+        if xdr:
+            sentences.append(xdr)
+
         return sentences
 
 
@@ -539,16 +684,24 @@ def main():
                         help='GPS polling interval in seconds')
     parser.add_argument('--smoothing', type=int, default=6,
                         help='Number of samples to average for speed/heading smoothing (default: 6)')
+    parser.add_argument('--heading-offset', type=float, default=0.0,
+                        help='Static compass heading offset in degrees (vessel_heading = dish_azimuth + offset)')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging')
-    
+
     args = parser.parse_args()
-    
+
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
     logger.info(f"Speed/heading smoothing: {args.smoothing} samples")
-    starlink = StarlinkGRPCClient(dish_address=args.dish, smoothing_window=args.smoothing)
+    if args.heading_offset != 0:
+        logger.info(f"Compass heading offset: {args.heading_offset}°")
+    starlink = StarlinkGRPCClient(
+        dish_address=args.dish,
+        smoothing_window=args.smoothing,
+        heading_offset=args.heading_offset
+    )
     
     try:
         starlink.connect()
