@@ -1,0 +1,26 @@
+services:
+  starlink-nmea:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: starlink-nmea-server
+    # Host network required to reach Starlink dish at 192.168.100.1
+    network_mode: host
+    environment:
+      - STARLINK_DISH=192.168.100.1:9200
+      - NMEA_PORT=10110
+    command: >
+      --dish 192.168.100.1:9200
+      --host 0.0.0.0
+      --port 10110
+      --rate 1.0
+      --poll-interval 0.5
+      --smoothing 6
+    restart: unless-stopped
+
+  dev:
+    image: 24add125c5476301421cc20970720ec1480f1896bd3cef2201a4fb9917c8778b
+    volumes:
+      - ./:/app
+      - ./.home:/root
+    tty: true
