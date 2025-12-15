@@ -33,6 +33,32 @@ def calculate_nmea_checksum(sentence: str) -> str:
     return f"{checksum:02X}"
 
 
+def verify_nmea_checksum(sentence: str) -> bool:
+    """Verify NMEA sentence checksum"""
+    if not sentence.startswith('$') or '*' not in sentence:
+        return False
+    try:
+        # Remove $ prefix and split at *
+        body = sentence[1:sentence.index('*')]
+        expected_cs = sentence[sentence.index('*') + 1:].strip().upper()
+        calculated_cs = calculate_nmea_checksum(body)
+        return calculated_cs == expected_cs
+    except Exception:
+        return False
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance between two coordinates in meters"""
+    R = 6371000  # Earth radius in meters
+    lat1_rad, lat2_rad = math.radians(lat1), math.radians(lat2)
+    dlat = lat2_rad - lat1_rad
+    dlon = math.radians(lon2 - lon1)
+
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+
 def format_nmea_sentence(sentence: str) -> str:
     """Format a complete NMEA sentence"""
     checksum = calculate_nmea_checksum(sentence)
@@ -120,10 +146,520 @@ class GPSData:
     @property
     def speed_knots(self) -> float:
         return self.speed_mps * 1.94384
-    
+
     @property
     def speed_kmh(self) -> float:
         return self.speed_mps * 3.6
+
+
+class NMEAParser:
+    """Parses incoming NMEA sentences to extract GPS data"""
+
+    @staticmethod
+    def parse_coordinate(value: str, direction: str, is_longitude: bool = False) -> Optional[float]:
+        """Parse NMEA coordinate format (DDDMM.MMMM or DDMM.MMMM) to decimal degrees"""
+        if not value or not direction:
+            return None
+        try:
+            if is_longitude:
+                degrees = int(value[:3])
+                minutes = float(value[3:])
+            else:
+                degrees = int(value[:2])
+                minutes = float(value[2:])
+
+            decimal = degrees + minutes / 60.0
+            if direction in ('S', 'W'):
+                decimal = -decimal
+            return decimal
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def parse_gpgga(fields: List[str]) -> dict:
+        """Parse GPGGA sentence - Global Positioning System Fix Data"""
+        result = {}
+        if len(fields) < 15:
+            return result
+
+        # Fields: time, lat, lat_dir, lon, lon_dir, fix_qual, num_sats, hdop, alt, alt_unit, geoid, geoid_unit, age, station_id
+        lat = NMEAParser.parse_coordinate(fields[2], fields[3], is_longitude=False)
+        lon = NMEAParser.parse_coordinate(fields[4], fields[5], is_longitude=True)
+
+        if lat is not None:
+            result['latitude'] = lat
+        if lon is not None:
+            result['longitude'] = lon
+
+        try:
+            if fields[6]:
+                result['fix_quality'] = int(fields[6])
+            if fields[7]:
+                result['satellites_used'] = int(fields[7])
+            if fields[8]:
+                result['hdop'] = float(fields[8])
+            if fields[9]:
+                result['altitude'] = float(fields[9])
+            if fields[1]:
+                # Parse time HHMMSS.SS
+                time_str = fields[1]
+                result['time'] = time_str
+        except (ValueError, IndexError):
+            pass
+
+        return result
+
+    @staticmethod
+    def parse_gprmc(fields: List[str]) -> dict:
+        """Parse GPRMC sentence - Recommended Minimum Navigation Information"""
+        result = {}
+        if len(fields) < 12:
+            return result
+
+        # Fields: time, status, lat, lat_dir, lon, lon_dir, speed_knots, course, date, mag_var, var_dir, mode
+        if fields[2] != 'A':  # A=Active, V=Void
+            return result
+
+        lat = NMEAParser.parse_coordinate(fields[3], fields[4], is_longitude=False)
+        lon = NMEAParser.parse_coordinate(fields[5], fields[6], is_longitude=True)
+
+        if lat is not None:
+            result['latitude'] = lat
+        if lon is not None:
+            result['longitude'] = lon
+
+        try:
+            if fields[7]:
+                result['speed_knots'] = float(fields[7])
+                result['speed_mps'] = float(fields[7]) / 1.94384
+            if fields[8]:
+                result['heading'] = float(fields[8])
+            if fields[1]:
+                result['time'] = fields[1]
+            if fields[9]:
+                result['date'] = fields[9]
+        except (ValueError, IndexError):
+            pass
+
+        return result
+
+    @staticmethod
+    def parse_gpgsa(fields: List[str]) -> dict:
+        """Parse GPGSA sentence - GPS DOP and Active Satellites"""
+        result = {}
+        if len(fields) < 18:
+            return result
+
+        try:
+            if fields[2]:
+                result['fix_mode'] = int(fields[2])  # 1=no fix, 2=2D, 3=3D
+            if fields[15]:
+                result['pdop'] = float(fields[15])
+            if fields[16]:
+                result['hdop'] = float(fields[16])
+            if fields[17].split('*')[0]:  # May have checksum attached
+                result['vdop'] = float(fields[17].split('*')[0])
+        except (ValueError, IndexError):
+            pass
+
+        return result
+
+    @staticmethod
+    def parse_gpvtg(fields: List[str]) -> dict:
+        """Parse GPVTG sentence - Track Made Good and Ground Speed"""
+        result = {}
+        if len(fields) < 9:
+            return result
+
+        try:
+            if fields[1]:
+                result['heading'] = float(fields[1])  # True heading
+            if fields[5]:
+                result['speed_knots'] = float(fields[5])
+                result['speed_mps'] = float(fields[5]) / 1.94384
+            if fields[7]:
+                result['speed_kmh'] = float(fields[7])
+        except (ValueError, IndexError):
+            pass
+
+        return result
+
+    @staticmethod
+    def parse_sentence(sentence: str) -> Tuple[str, dict]:
+        """Parse any NMEA sentence, return (sentence_type, parsed_data)"""
+        if not verify_nmea_checksum(sentence):
+            return ('INVALID', {})
+
+        try:
+            # Remove $ and checksum
+            body = sentence[1:sentence.index('*')]
+            fields = body.split(',')
+            sentence_type = fields[0].upper()
+
+            if sentence_type == 'GPGGA':
+                return (sentence_type, NMEAParser.parse_gpgga(fields))
+            elif sentence_type == 'GPRMC':
+                return (sentence_type, NMEAParser.parse_gprmc(fields))
+            elif sentence_type == 'GPGSA':
+                return (sentence_type, NMEAParser.parse_gpgsa(fields))
+            elif sentence_type == 'GPVTG':
+                return (sentence_type, NMEAParser.parse_gpvtg(fields))
+            else:
+                return (sentence_type, {})
+        except Exception:
+            return ('ERROR', {})
+
+
+class ExternalGPSReceiver:
+    """TCP server that receives NMEA data from external GPS devices"""
+
+    def __init__(self, host: str = '0.0.0.0', port: int = 60660):
+        self.host = host
+        self.port = port
+        self.gps_data = GPSData()
+        self.lock = threading.Lock()
+        self.running = False
+        self.connected = False
+        self.last_update: Optional[datetime] = None
+        self.last_log: Optional[datetime] = None
+        self.sentence_count = 0
+
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Handle incoming NMEA data from a connected GPS device"""
+        logger.info(f"External GPS connected: {address}")
+        self.connected = True
+        buffer = ""
+
+        try:
+            while self.running:
+                try:
+                    data = client_socket.recv(1024)
+                    if not data:
+                        break
+
+                    buffer += data.decode('ascii', errors='ignore')
+
+                    # Process complete sentences
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if line.startswith('$'):
+                            self._process_sentence(line)
+
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logger.warning(f"External GPS receive error: {e}")
+                    break
+
+        finally:
+            self.connected = False
+            client_socket.close()
+            logger.info(f"External GPS disconnected: {address}")
+
+    def _process_sentence(self, sentence: str):
+        """Process a single NMEA sentence and update GPS data"""
+        sentence_type, parsed = NMEAParser.parse_sentence(sentence)
+
+        if not parsed:
+            return
+
+        with self.lock:
+            if 'latitude' in parsed:
+                self.gps_data.latitude = parsed['latitude']
+            if 'longitude' in parsed:
+                self.gps_data.longitude = parsed['longitude']
+            if 'altitude' in parsed:
+                self.gps_data.altitude = parsed['altitude']
+            if 'speed_mps' in parsed:
+                self.gps_data.speed_mps = parsed['speed_mps']
+            if 'heading' in parsed:
+                self.gps_data.heading = parsed['heading']
+            if 'hdop' in parsed:
+                self.gps_data.hdop = parsed['hdop']
+            if 'vdop' in parsed:
+                self.gps_data.vdop = parsed['vdop']
+            if 'pdop' in parsed:
+                self.gps_data.pdop = parsed['pdop']
+            if 'satellites_used' in parsed:
+                self.gps_data.satellites_used = parsed['satellites_used']
+            if 'fix_quality' in parsed:
+                self.gps_data.fix_quality = parsed['fix_quality']
+
+            self.gps_data.timestamp = datetime.now(timezone.utc)
+            self.last_update = self.gps_data.timestamp
+            self.sentence_count += 1
+
+            # Log external GPS status periodically (every 10 seconds)
+            now = datetime.now(timezone.utc)
+            if self.last_log is None or (now - self.last_log).total_seconds() > 10:
+                if self.gps_data.latitude != 0 or self.gps_data.longitude != 0:
+                    logger.info(
+                        f"External GPS: {self.gps_data.latitude:.6f}, {self.gps_data.longitude:.6f}, "
+                        f"alt={self.gps_data.altitude:.1f}m, hdop={self.gps_data.hdop:.1f}, "
+                        f"sats={self.gps_data.satellites_used}, sentences={self.sentence_count}"
+                    )
+                    self.last_log = now
+
+    def start(self):
+        """Start the external GPS receiver server"""
+        self.running = True
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.host, self.port))
+        server_socket.listen(1)  # Only accept one GPS device connection
+        server_socket.settimeout(1.0)
+
+        logger.info(f"External GPS receiver listening on {self.host}:{self.port}")
+
+        try:
+            while self.running:
+                try:
+                    client_socket, address = server_socket.accept()
+                    client_socket.settimeout(5.0)
+                    # Handle in a separate thread
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address),
+                        daemon=True
+                    )
+                    client_thread.start()
+                except socket.timeout:
+                    continue
+        finally:
+            server_socket.close()
+
+    def get_gps_data(self) -> Optional[GPSData]:
+        """Get current GPS data if available and recent (thread-safe)"""
+        with self.lock:
+            # Return None if no recent data (older than 5 seconds)
+            if self.last_update is None:
+                return None
+            age = (datetime.now(timezone.utc) - self.last_update).total_seconds()
+            if age > 5.0:
+                return None
+
+            return GPSData(
+                latitude=self.gps_data.latitude,
+                longitude=self.gps_data.longitude,
+                altitude=self.gps_data.altitude,
+                speed_mps=self.gps_data.speed_mps,
+                heading=self.gps_data.heading,
+                timestamp=self.gps_data.timestamp,
+                hdop=self.gps_data.hdop,
+                vdop=self.gps_data.vdop,
+                pdop=self.gps_data.pdop,
+                satellites_used=self.gps_data.satellites_used,
+                fix_quality=self.gps_data.fix_quality
+            )
+
+    def is_available(self) -> bool:
+        """Check if external GPS data is available and recent"""
+        return self.get_gps_data() is not None
+
+    def stop(self):
+        """Stop the receiver"""
+        self.running = False
+
+
+class GPSDataFusion:
+    """Fuses GPS data from multiple sources with quality-based weighting"""
+
+    # Deviation thresholds in meters
+    THRESHOLD_AVERAGE = 50.0     # Below this: average both sources
+    THRESHOLD_PREFER = 200.0    # Below this: prefer better quality source
+    # Above THRESHOLD_PREFER: use only best quality source
+
+    def __init__(self):
+        self.last_fusion_log: Optional[datetime] = None
+        self.current_mode: str = "starlink_only"
+        self.current_deviation: Optional[float] = None
+        self.starlink_quality: Optional[float] = None
+        self.external_quality: Optional[float] = None
+
+    def fuse(self, starlink_data: Optional[GPSData], external_data: Optional[GPSData]) -> Optional[GPSData]:
+        """
+        Fuse GPS data from Starlink and external sources.
+
+        Returns the best available GPS data based on:
+        1. Position deviation between sources
+        2. Quality metrics (HDOP, satellites)
+        3. Data freshness
+        """
+        # Handle cases where only one source is available
+        if starlink_data is None and external_data is None:
+            self.current_mode = "no_data"
+            self.current_deviation = None
+            return None
+
+        if starlink_data is None:
+            self.current_mode = "external_only"
+            self.current_deviation = None
+            self._log_fusion("external_only", None, None, external_data)
+            return external_data
+
+        if external_data is None:
+            self.current_mode = "starlink_only"
+            self.current_deviation = None
+            self._log_fusion("starlink_only", starlink_data, None, None)
+            return starlink_data
+
+        # Both sources available - check for valid positions
+        starlink_valid = starlink_data.latitude != 0 or starlink_data.longitude != 0
+        external_valid = external_data.latitude != 0 or external_data.longitude != 0
+
+        if not starlink_valid and not external_valid:
+            self.current_mode = "no_data"
+            return None
+        if not starlink_valid:
+            self.current_mode = "external_only"
+            self.current_deviation = None
+            self._log_fusion("external_only", None, None, external_data)
+            return external_data
+        if not external_valid:
+            self.current_mode = "starlink_only"
+            self.current_deviation = None
+            self._log_fusion("starlink_only", starlink_data, None, None)
+            return starlink_data
+
+        # Calculate position deviation
+        deviation = haversine_distance(
+            starlink_data.latitude, starlink_data.longitude,
+            external_data.latitude, external_data.longitude
+        )
+        self.current_deviation = deviation
+
+        # Calculate quality scores (lower HDOP is better, more satellites is better)
+        # Score = satellites / hdop (higher is better)
+        self.starlink_quality = starlink_data.satellites_used / max(starlink_data.hdop, 0.1)
+        self.external_quality = external_data.satellites_used / max(external_data.hdop, 0.1)
+
+        if deviation < self.THRESHOLD_AVERAGE:
+            # Small deviation: weighted average based on quality
+            self.current_mode = "fused"
+            self._log_fusion("fused", starlink_data, external_data, None, deviation)
+            return self._weighted_average(starlink_data, external_data, self.starlink_quality, self.external_quality)
+
+        elif deviation < self.THRESHOLD_PREFER:
+            # Medium deviation: prefer better quality source but log the discrepancy
+            if self.starlink_quality >= self.external_quality:
+                self.current_mode = "prefer_starlink"
+                self._log_fusion("prefer_starlink", starlink_data, external_data, None, deviation)
+                return self._merge_best_of_both(starlink_data, external_data, prefer_starlink=True)
+            else:
+                self.current_mode = "prefer_external"
+                self._log_fusion("prefer_external", starlink_data, external_data, None, deviation)
+                return self._merge_best_of_both(starlink_data, external_data, prefer_starlink=False)
+
+        else:
+            # Large deviation: use only the best quality source, ignore the other
+            if self.starlink_quality >= self.external_quality:
+                self.current_mode = "starlink_only_deviation"
+                self._log_fusion("starlink_only_deviation", starlink_data, external_data, None, deviation)
+                return starlink_data
+            else:
+                self.current_mode = "external_only_deviation"
+                self._log_fusion("external_only_deviation", starlink_data, external_data, None, deviation)
+                return external_data
+
+    def get_source_label(self) -> str:
+        """Get a human-readable label for current GPS source"""
+        labels = {
+            "no_data": "NO_FIX",
+            "starlink_only": "STARLINK",
+            "external_only": "EXTERNAL",
+            "fused": "FUSED",
+            "prefer_starlink": "STARLINK*",
+            "prefer_external": "EXTERNAL*",
+            "starlink_only_deviation": "STARLINK!",
+            "external_only_deviation": "EXTERNAL!",
+        }
+        return labels.get(self.current_mode, "UNKNOWN")
+
+    def _weighted_average(self, starlink: GPSData, external: GPSData,
+                          starlink_score: float, external_score: float) -> GPSData:
+        """Create weighted average of both GPS sources"""
+        total_score = starlink_score + external_score
+        w_starlink = starlink_score / total_score
+        w_external = external_score / total_score
+
+        return GPSData(
+            latitude=starlink.latitude * w_starlink + external.latitude * w_external,
+            longitude=starlink.longitude * w_starlink + external.longitude * w_external,
+            altitude=starlink.altitude * w_starlink + external.altitude * w_external,
+            speed_mps=starlink.speed_mps * w_starlink + external.speed_mps * w_external,
+            heading=self._average_heading(starlink.heading, external.heading, w_starlink, w_external),
+            timestamp=max(starlink.timestamp, external.timestamp),
+            # Use the better values for metadata
+            compass_heading=starlink.compass_heading,  # Only Starlink has compass
+            boresight_azimuth=starlink.boresight_azimuth,
+            boresight_elevation=starlink.boresight_elevation,
+            tilt=starlink.tilt,
+            hdop=min(starlink.hdop, external.hdop),
+            vdop=min(starlink.vdop, external.vdop),
+            pdop=min(starlink.pdop, external.pdop),
+            satellites_used=max(starlink.satellites_used, external.satellites_used),
+            fix_quality=max(starlink.fix_quality, external.fix_quality)
+        )
+
+    def _merge_best_of_both(self, starlink: GPSData, external: GPSData,
+                            prefer_starlink: bool) -> GPSData:
+        """Use position from preferred source but keep best metadata from both"""
+        primary = starlink if prefer_starlink else external
+
+        return GPSData(
+            latitude=primary.latitude,
+            longitude=primary.longitude,
+            altitude=primary.altitude,
+            speed_mps=primary.speed_mps,
+            heading=primary.heading,
+            timestamp=primary.timestamp,
+            # Always use Starlink's compass data
+            compass_heading=starlink.compass_heading,
+            boresight_azimuth=starlink.boresight_azimuth,
+            boresight_elevation=starlink.boresight_elevation,
+            tilt=starlink.tilt,
+            # Use the better quality indicators
+            hdop=min(starlink.hdop, external.hdop),
+            vdop=min(starlink.vdop, external.vdop),
+            pdop=min(starlink.pdop, external.pdop),
+            satellites_used=max(starlink.satellites_used, external.satellites_used),
+            fix_quality=max(starlink.fix_quality, external.fix_quality)
+        )
+
+    def _average_heading(self, h1: float, h2: float, w1: float, w2: float) -> float:
+        """Average two headings using circular mean"""
+        # Convert to unit vectors
+        sin1, cos1 = math.sin(math.radians(h1)), math.cos(math.radians(h1))
+        sin2, cos2 = math.sin(math.radians(h2)), math.cos(math.radians(h2))
+
+        # Weighted average of components
+        avg_sin = sin1 * w1 + sin2 * w2
+        avg_cos = cos1 * w1 + cos2 * w2
+
+        # Convert back to angle
+        return (math.degrees(math.atan2(avg_sin, avg_cos)) + 360) % 360
+
+    def _log_fusion(self, mode: str, starlink: Optional[GPSData], external: Optional[GPSData],
+                     result: Optional[GPSData], deviation: Optional[float] = None):
+        """Log fusion decisions periodically with detailed source info"""
+        now = datetime.now(timezone.utc)
+        # Log at most once every 10 seconds
+        if self.last_fusion_log is None or (now - self.last_fusion_log).total_seconds() > 10:
+            parts = [f"GPS source: {self.get_source_label()}"]
+
+            if deviation is not None:
+                parts.append(f"deviation={deviation:.1f}m")
+
+            if starlink is not None:
+                parts.append(f"starlink[{starlink.latitude:.6f},{starlink.longitude:.6f} hdop={starlink.hdop:.1f} sats={starlink.satellites_used}]")
+
+            if external is not None:
+                parts.append(f"external[{external.latitude:.6f},{external.longitude:.6f} hdop={external.hdop:.1f} sats={external.satellites_used}]")
+
+            logger.info(" | ".join(parts))
+            self.last_fusion_log = now
 
 
 class StarlinkGRPCClient:
@@ -572,11 +1108,14 @@ class NMEAGenerator:
 
 class NMEATCPServer:
     """TCP server that broadcasts NMEA messages"""
-    
+
     def __init__(self, starlink_client: StarlinkGRPCClient,
                  host: str = '0.0.0.0', port: int = 10110,
-                 update_rate: float = 1.0):
+                 update_rate: float = 1.0,
+                 external_gps: Optional[ExternalGPSReceiver] = None):
         self.starlink = starlink_client
+        self.external_gps = external_gps
+        self.fusion = GPSDataFusion() if external_gps else None
         self.host = host
         self.port = port
         self.update_rate = update_rate
@@ -603,15 +1142,29 @@ class NMEATCPServer:
     
     def broadcast_nmea(self):
         """Broadcast NMEA to all clients"""
+        broadcast_count = 0
         while self.running:
-            gps_data = self.starlink.get_gps_data()
-            
+            broadcast_count += 1
+            # Get GPS data from available sources
+            starlink_data = self.starlink.get_gps_data()
+
+            # If we have external GPS and fusion enabled, fuse the data
+            if self.fusion and self.external_gps:
+                external_data = self.external_gps.get_gps_data()
+                gps_data = self.fusion.fuse(starlink_data, external_data)
+                source_label = self.fusion.get_source_label()
+                deviation = self.fusion.current_deviation
+            else:
+                gps_data = starlink_data
+                source_label = "STARLINK"
+                deviation = None
+
             # Only send if we have valid GPS data
-            if gps_data.latitude != 0 or gps_data.longitude != 0:
+            if gps_data and (gps_data.latitude != 0 or gps_data.longitude != 0):
                 nmea_gen = NMEAGenerator(gps_data)
                 sentences = nmea_gen.generate_all()
                 data = '\r\n'.join(sentences) + '\r\n'
-                
+
                 with self.clients_lock:
                     disconnected = []
                     for client in self.clients:
@@ -619,19 +1172,30 @@ class NMEATCPServer:
                             client.sendall(data.encode('ascii'))
                         except Exception:
                             disconnected.append(client)
-                    
+
                     for client in disconnected:
                         self.clients.remove(client)
                         try:
                             client.close()
                         except Exception:
                             pass
-                
+
+                # Log GPS status periodically (every 10 broadcasts, ~10 seconds at 1Hz)
+                if broadcast_count <= 3 or broadcast_count % 10 == 0:
+                    compass_str = f", compass={gps_data.compass_heading:.1f}°" if gps_data.compass_heading is not None else ""
+                    tilt_str = f", tilt={gps_data.tilt:.1f}°" if gps_data.tilt is not None else ""
+                    deviation_str = f", dev={deviation:.1f}m" if deviation is not None else ""
+                    logger.info(
+                        f"GPS [{source_label}]: {gps_data.latitude:.6f}, {gps_data.longitude:.6f}, "
+                        f"alt={gps_data.altitude:.1f}m, speed={gps_data.speed_knots:.1f}kts"
+                        f"{compass_str}{tilt_str}{deviation_str}"
+                    )
+
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Sent {len(sentences)} NMEA sentences to {len(self.clients)} clients")
             else:
                 logger.debug("Waiting for valid GPS data...")
-            
+
             time.sleep(self.update_rate)
     
     def start(self):
@@ -670,7 +1234,7 @@ class NMEATCPServer:
 
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Starlink GPS to NMEA TCP Server')
     parser.add_argument('--dish', default='192.168.100.1:9200',
                         help='Starlink dish gRPC address')
@@ -689,6 +1253,12 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging')
 
+    # External GPS options
+    parser.add_argument('--external-gps-port', type=int, default=0,
+                        help='Port to listen for external GPS NMEA data (0 = disabled, default: 0)')
+    parser.add_argument('--external-gps-host', default='0.0.0.0',
+                        help='Host to listen for external GPS NMEA data (default: 0.0.0.0)')
+
     args = parser.parse_args()
 
     if args.debug:
@@ -697,15 +1267,18 @@ def main():
     logger.info(f"Speed/heading smoothing: {args.smoothing} samples")
     if args.heading_offset != 0:
         logger.info(f"Compass heading offset: {args.heading_offset}°")
+
     starlink = StarlinkGRPCClient(
         dish_address=args.dish,
         smoothing_window=args.smoothing,
         heading_offset=args.heading_offset
     )
-    
+
+    external_gps = None
+
     try:
         starlink.connect()
-        
+
         # Start GPS polling in background
         poll_thread = threading.Thread(
             target=starlink.start_polling,
@@ -713,7 +1286,21 @@ def main():
             daemon=True
         )
         poll_thread.start()
-        
+
+        # Start external GPS receiver if enabled
+        if args.external_gps_port > 0:
+            external_gps = ExternalGPSReceiver(
+                host=args.external_gps_host,
+                port=args.external_gps_port
+            )
+            external_gps_thread = threading.Thread(
+                target=external_gps.start,
+                daemon=True
+            )
+            external_gps_thread.start()
+            logger.info(f"External GPS fusion enabled - listening on port {args.external_gps_port}")
+            logger.info("Fusion thresholds: <50m=average, 50-200m=prefer better, >200m=use best only")
+
         # Wait for first fix
         logger.info("Waiting for GPS fix...")
         for i in range(10):
@@ -724,16 +1311,17 @@ def main():
                 break
         else:
             logger.warning("No GPS fix after 10 seconds, starting anyway...")
-        
+
         # Start NMEA server
         server = NMEATCPServer(
-            starlink, 
-            host=args.host, 
+            starlink,
+            host=args.host,
             port=args.port,
-            update_rate=args.rate
+            update_rate=args.rate,
+            external_gps=external_gps
         )
         server.start()
-        
+
     except KeyboardInterrupt:
         logger.info("Interrupted")
     except Exception as e:
@@ -741,6 +1329,8 @@ def main():
         raise
     finally:
         starlink.disconnect()
+        if external_gps:
+            external_gps.stop()
 
 
 if __name__ == '__main__':
