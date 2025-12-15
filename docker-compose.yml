@@ -16,6 +16,7 @@ services:
       --rate 1.0
       --poll-interval 0.5
       --smoothing 6
+      --heading-offset 0
     restart: unless-stopped
 
   dev:
