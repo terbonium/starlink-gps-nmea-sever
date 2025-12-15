@@ -321,6 +321,8 @@ class ExternalGPSReceiver:
         self.running = False
         self.connected = False
         self.last_update: Optional[datetime] = None
+        self.last_log: Optional[datetime] = None
+        self.sentence_count = 0
 
     def handle_client(self, client_socket: socket.socket, address: tuple):
         """Handle incoming NMEA data from a connected GPS device"""
@@ -386,6 +388,18 @@ class ExternalGPSReceiver:
 
             self.gps_data.timestamp = datetime.now(timezone.utc)
             self.last_update = self.gps_data.timestamp
+            self.sentence_count += 1
+
+            # Log external GPS status periodically (every 10 seconds)
+            now = datetime.now(timezone.utc)
+            if self.last_log is None or (now - self.last_log).total_seconds() > 10:
+                if self.gps_data.latitude != 0 or self.gps_data.longitude != 0:
+                    logger.info(
+                        f"External GPS: {self.gps_data.latitude:.6f}, {self.gps_data.longitude:.6f}, "
+                        f"alt={self.gps_data.altitude:.1f}m, hdop={self.gps_data.hdop:.1f}, "
+                        f"sats={self.gps_data.satellites_used}, sentences={self.sentence_count}"
+                    )
+                    self.last_log = now
 
     def start(self):
         """Start the external GPS receiver server"""
@@ -459,6 +473,10 @@ class GPSDataFusion:
 
     def __init__(self):
         self.last_fusion_log: Optional[datetime] = None
+        self.current_mode: str = "starlink_only"
+        self.current_deviation: Optional[float] = None
+        self.starlink_quality: Optional[float] = None
+        self.external_quality: Optional[float] = None
 
     def fuse(self, starlink_data: Optional[GPSData], external_data: Optional[GPSData]) -> Optional[GPSData]:
         """
@@ -471,14 +489,20 @@ class GPSDataFusion:
         """
         # Handle cases where only one source is available
         if starlink_data is None and external_data is None:
+            self.current_mode = "no_data"
+            self.current_deviation = None
             return None
 
         if starlink_data is None:
-            self._log_fusion("external_only", None)
+            self.current_mode = "external_only"
+            self.current_deviation = None
+            self._log_fusion("external_only", None, None, external_data)
             return external_data
 
         if external_data is None:
-            self._log_fusion("starlink_only", None)
+            self.current_mode = "starlink_only"
+            self.current_deviation = None
+            self._log_fusion("starlink_only", starlink_data, None, None)
             return starlink_data
 
         # Both sources available - check for valid positions
@@ -486,12 +510,17 @@ class GPSDataFusion:
         external_valid = external_data.latitude != 0 or external_data.longitude != 0
 
         if not starlink_valid and not external_valid:
+            self.current_mode = "no_data"
             return None
         if not starlink_valid:
-            self._log_fusion("external_only", None)
+            self.current_mode = "external_only"
+            self.current_deviation = None
+            self._log_fusion("external_only", None, None, external_data)
             return external_data
         if not external_valid:
-            self._log_fusion("starlink_only", None)
+            self.current_mode = "starlink_only"
+            self.current_deviation = None
+            self._log_fusion("starlink_only", starlink_data, None, None)
             return starlink_data
 
         # Calculate position deviation
@@ -499,34 +528,54 @@ class GPSDataFusion:
             starlink_data.latitude, starlink_data.longitude,
             external_data.latitude, external_data.longitude
         )
+        self.current_deviation = deviation
 
         # Calculate quality scores (lower HDOP is better, more satellites is better)
         # Score = satellites / hdop (higher is better)
-        starlink_score = starlink_data.satellites_used / max(starlink_data.hdop, 0.1)
-        external_score = external_data.satellites_used / max(external_data.hdop, 0.1)
+        self.starlink_quality = starlink_data.satellites_used / max(starlink_data.hdop, 0.1)
+        self.external_quality = external_data.satellites_used / max(external_data.hdop, 0.1)
 
         if deviation < self.THRESHOLD_AVERAGE:
             # Small deviation: weighted average based on quality
-            self._log_fusion("averaged", deviation)
-            return self._weighted_average(starlink_data, external_data, starlink_score, external_score)
+            self.current_mode = "fused"
+            self._log_fusion("fused", starlink_data, external_data, None, deviation)
+            return self._weighted_average(starlink_data, external_data, self.starlink_quality, self.external_quality)
 
         elif deviation < self.THRESHOLD_PREFER:
             # Medium deviation: prefer better quality source but log the discrepancy
-            if starlink_score >= external_score:
-                self._log_fusion("prefer_starlink", deviation)
+            if self.starlink_quality >= self.external_quality:
+                self.current_mode = "prefer_starlink"
+                self._log_fusion("prefer_starlink", starlink_data, external_data, None, deviation)
                 return self._merge_best_of_both(starlink_data, external_data, prefer_starlink=True)
             else:
-                self._log_fusion("prefer_external", deviation)
+                self.current_mode = "prefer_external"
+                self._log_fusion("prefer_external", starlink_data, external_data, None, deviation)
                 return self._merge_best_of_both(starlink_data, external_data, prefer_starlink=False)
 
         else:
             # Large deviation: use only the best quality source, ignore the other
-            if starlink_score >= external_score:
-                self._log_fusion("starlink_only_deviation", deviation)
+            if self.starlink_quality >= self.external_quality:
+                self.current_mode = "starlink_only_deviation"
+                self._log_fusion("starlink_only_deviation", starlink_data, external_data, None, deviation)
                 return starlink_data
             else:
-                self._log_fusion("external_only_deviation", deviation)
+                self.current_mode = "external_only_deviation"
+                self._log_fusion("external_only_deviation", starlink_data, external_data, None, deviation)
                 return external_data
+
+    def get_source_label(self) -> str:
+        """Get a human-readable label for current GPS source"""
+        labels = {
+            "no_data": "NO_FIX",
+            "starlink_only": "STARLINK",
+            "external_only": "EXTERNAL",
+            "fused": "FUSED",
+            "prefer_starlink": "STARLINK*",
+            "prefer_external": "EXTERNAL*",
+            "starlink_only_deviation": "STARLINK!",
+            "external_only_deviation": "EXTERNAL!",
+        }
+        return labels.get(self.current_mode, "UNKNOWN")
 
     def _weighted_average(self, starlink: GPSData, external: GPSData,
                           starlink_score: float, external_score: float) -> GPSData:
@@ -592,15 +641,24 @@ class GPSDataFusion:
         # Convert back to angle
         return (math.degrees(math.atan2(avg_sin, avg_cos)) + 360) % 360
 
-    def _log_fusion(self, mode: str, deviation: Optional[float]):
-        """Log fusion decisions periodically"""
+    def _log_fusion(self, mode: str, starlink: Optional[GPSData], external: Optional[GPSData],
+                     result: Optional[GPSData], deviation: Optional[float] = None):
+        """Log fusion decisions periodically with detailed source info"""
         now = datetime.now(timezone.utc)
         # Log at most once every 10 seconds
         if self.last_fusion_log is None or (now - self.last_fusion_log).total_seconds() > 10:
+            parts = [f"GPS source: {self.get_source_label()}"]
+
             if deviation is not None:
-                logger.info(f"GPS fusion: {mode} (deviation: {deviation:.1f}m)")
-            else:
-                logger.debug(f"GPS fusion: {mode}")
+                parts.append(f"deviation={deviation:.1f}m")
+
+            if starlink is not None:
+                parts.append(f"starlink[{starlink.latitude:.6f},{starlink.longitude:.6f} hdop={starlink.hdop:.1f} sats={starlink.satellites_used}]")
+
+            if external is not None:
+                parts.append(f"external[{external.latitude:.6f},{external.longitude:.6f} hdop={external.hdop:.1f} sats={external.satellites_used}]")
+
+            logger.info(" | ".join(parts))
             self.last_fusion_log = now
 
 
@@ -1084,7 +1142,9 @@ class NMEATCPServer:
     
     def broadcast_nmea(self):
         """Broadcast NMEA to all clients"""
+        broadcast_count = 0
         while self.running:
+            broadcast_count += 1
             # Get GPS data from available sources
             starlink_data = self.starlink.get_gps_data()
 
@@ -1092,15 +1152,19 @@ class NMEATCPServer:
             if self.fusion and self.external_gps:
                 external_data = self.external_gps.get_gps_data()
                 gps_data = self.fusion.fuse(starlink_data, external_data)
+                source_label = self.fusion.get_source_label()
+                deviation = self.fusion.current_deviation
             else:
                 gps_data = starlink_data
+                source_label = "STARLINK"
+                deviation = None
 
             # Only send if we have valid GPS data
             if gps_data and (gps_data.latitude != 0 or gps_data.longitude != 0):
                 nmea_gen = NMEAGenerator(gps_data)
                 sentences = nmea_gen.generate_all()
                 data = '\r\n'.join(sentences) + '\r\n'
-                
+
                 with self.clients_lock:
                     disconnected = []
                     for client in self.clients:
@@ -1108,19 +1172,30 @@ class NMEATCPServer:
                             client.sendall(data.encode('ascii'))
                         except Exception:
                             disconnected.append(client)
-                    
+
                     for client in disconnected:
                         self.clients.remove(client)
                         try:
                             client.close()
                         except Exception:
                             pass
-                
+
+                # Log GPS status periodically (every 10 broadcasts, ~10 seconds at 1Hz)
+                if broadcast_count <= 3 or broadcast_count % 10 == 0:
+                    compass_str = f", compass={gps_data.compass_heading:.1f}°" if gps_data.compass_heading is not None else ""
+                    tilt_str = f", tilt={gps_data.tilt:.1f}°" if gps_data.tilt is not None else ""
+                    deviation_str = f", dev={deviation:.1f}m" if deviation is not None else ""
+                    logger.info(
+                        f"GPS [{source_label}]: {gps_data.latitude:.6f}, {gps_data.longitude:.6f}, "
+                        f"alt={gps_data.altitude:.1f}m, speed={gps_data.speed_knots:.1f}kts"
+                        f"{compass_str}{tilt_str}{deviation_str}"
+                    )
+
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Sent {len(sentences)} NMEA sentences to {len(self.clients)} clients")
             else:
                 logger.debug("Waiting for valid GPS data...")
-            
+
             time.sleep(self.update_rate)
     
     def start(self):
